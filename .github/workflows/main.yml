@@ -1,0 +1,181 @@
+name: Booming Music
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Unzip BoomingMusic zip (if present)
+        run: |
+          mkdir -p src
+          if [ -f BoomingMusic-1.1.0-rc.5.zip ]; then
+            echo "Found zip, extracting..."
+            unzip -q BoomingMusic-1.1.0-rc.5.zip -d src
+          else
+            echo "No BoomingMusic zip found; ensure sources are in repo or attach zip to the workspace."
+          fi
+          echo "Top-level of src:"
+          ls -la src || true
+
+      - name: Inspect src (debug)
+        if: ${{ github.event.inputs.debug == 'true' || github.event_name == 'workflow_dispatch' }}
+        run: ls -R src || true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Gradle directories (optional - speeds up builds)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/gradle/wrapper/gradle-wrapper.properties') }}-${{ hashFiles('**/build.gradle*', '**/build.gradle.kts') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Build release (auto-detect project dir, write build.log to workspace)
+        id: build
+        run: |
+          set -euo pipefail
+          BUILD_LOG="$GITHUB_WORKSPACE/build.log"
+          : > "$BUILD_LOG"
+
+          # try to locate project root (prefer settings.gradle(.kts))
+          PROJECT_DIR=$(find src -maxdepth 4 -type f -name 'settings.gradle*' -printf '%h\n' | head -n1 || true)
+          if [ -z "$PROJECT_DIR" ]; then
+            PROJECT_DIR=$(find src -maxdepth 4 -type f \( -name 'build.gradle' -o -name 'build.gradle.kts' \) -printf '%h\n' | head -n1 || true)
+          fi
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: Could not find settings.gradle or build.gradle(.kts) under src. Listing src for debug:" | tee "$BUILD_LOG"
+            ls -R src | tee -a "$BUILD_LOG"
+            echo "build_succeeded=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "Found Gradle project directory: $PROJECT_DIR"
+          cd "$PROJECT_DIR"
+          echo "Working directory: $(pwd)"
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            echo "Using project Gradle wrapper (./gradlew)"
+            ./gradlew clean assembleRelease --no-daemon --stacktrace --warning-mode all > "$BUILD_LOG" 2>&1 || true
+            BUILD_EXIT=$?
+          else
+            echo "No gradlew wrapper found; falling back to system gradle" | tee -a "$BUILD_LOG"
+            gradle clean assembleRelease --no-daemon --stacktrace --warning-mode all > "$BUILD_LOG" 2>&1 || true
+            BUILD_EXIT=$?
+          fi
+
+          echo "Gradle exit code: $BUILD_EXIT" | tee -a "$BUILD_LOG"
+          echo "----- tail of build log -----" | tee -a "$BUILD_LOG"
+          tail -n 200 "$BUILD_LOG" | tee -a "$BUILD_LOG" || true
+
+          if [ "$BUILD_EXIT" -eq 0 ]; then
+            echo "build_succeeded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_succeeded=false" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: Show build.log head (for quick preview)
+        if: always()
+        run: |
+          echo "---- build.log head ----"
+          head -n 400 build.log || true
+          echo "---- end head ----"
+
+      - name: Upload build.log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+      - id: find_apk
+        name: Find and pick the best release APK for newer Android (prefer arm64-v8a)
+        if: always()
+        run: |
+          set -euo pipefail
+          # Collect all APKs under src that are in build/outputs/apk
+          mapfile -t APKS < <(find src -type f -name '*.apk' -print | grep '/build/outputs/apk/' || true)
+
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "No APKs found under src/**/build/outputs/apk/"
+            echo "apk_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Strategy:
+          # 1) Prefer files which have arm64-v8a in their path or filename
+          # 2) Fallback to universal or fat APKs (containing 'universal' or 'fat')
+          # 3) Fallback to the largest APK found (heuristic)
+          BEST=""
+          for a in "${APKS[@]}"; do
+            fname=$(basename "$a" | tr '[:upper:]' '[:lower:]')
+            if echo "$a" | tr '[:upper:]' '[:lower:]' | grep -q 'arm64-v8a'; then
+              BEST="$a"
+              break
+            fi
+            if echo "$fname" | grep -q 'arm64'; then
+              BEST="$a"
+            fi
+          done
+
+          # if we haven't found explicit arm64-v8a, prefer universal/fat APKs
+          if [ -z "$BEST" ]; then
+            for a in "${APKS[@]}"; do
+              fname=$(basename "$a" | tr '[:upper:]' '[:lower:]')
+              if echo "$fname" | grep -E -q 'universal|fat|all'; then
+                BEST="$a"
+                break
+              fi
+            done
+          fi
+
+          # final fallback: pick the largest APK
+          if [ -z "$BEST" ]; then
+            LARGEST="${APKS[0]}"
+            for a in "${APKS[@]}"; do
+              if [ "$(stat -c%s "$a")" -gt "$(stat -c%s "$LARGEST")" ]; then
+                LARGEST="$a"
+              fi
+            done
+            BEST="$LARGEST"
+          fi
+
+          echo "Selected APK for upload: $BEST (size: $(stat -c%s "$BEST"))"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          # Use a clear name indicating target arch preference
+          OUTNAME="BoomingMusic-release-$(basename "$BEST")"
+          cp -v "$BEST" "$GITHUB_WORKSPACE/dist/$OUTNAME"
+          echo "Copied to $GITHUB_WORKSPACE/dist/$OUTNAME"
+          echo "apk_path=dist/$OUTNAME" >> "$GITHUB_OUTPUT"
+          echo "apk_found=true" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Upload release APK artifact (arm64 preferred)
+        if: steps.find_apk.outputs.apk_found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: BoomingMusic-Release-APK-arm64-preferred
+          path: ${{ steps.find_apk.outputs.apk_path }}
+          # retention-days: 7
