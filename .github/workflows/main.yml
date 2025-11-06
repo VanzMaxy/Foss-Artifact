@@ -19,17 +19,27 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Workspace debug (top-level)
+        run: |
+          echo "Workspace top-level:"
+          ls -la || true
+
       - name: Unzip BoomingMusic zip (if present)
         run: |
+          set -euo pipefail
           mkdir -p src
-          if [ -f BoomingMusic-master.zip ]; then
-            echo "Found zip, extracting..."
-            unzip -q BoomingMusic-1.1.0-rc.5.zip -d src
+          # Find any zip that looks like the BoomingMusic package
+          ZIP=$(ls -1 BoomingMusic*.zip 2>/dev/null | head -n1 || true)
+          if [ -n "$ZIP" ]; then
+            echo "Found zip: $ZIP"
+            unzip -q "$ZIP" -d src
+            echo "Extraction complete. Top-level of src:"
+            ls -la src || true
           else
             echo "No BoomingMusic zip found; ensure sources are in repo or attach zip to the workspace."
+            echo "Top-level of src (may already contain project files):"
+            ls -la src || true
           fi
-          echo "Top-level of src:"
-          ls -la src || true
 
       - name: Inspect src (debug)
         if: ${{ github.event.inputs.debug == 'true' || github.event_name == 'workflow_dispatch' }}
@@ -57,11 +67,13 @@ jobs:
           set -euo pipefail
           BUILD_LOG="$GITHUB_WORKSPACE/build.log"
           : > "$BUILD_LOG"
+          echo "Build log will be written to: $BUILD_LOG"
 
           # try to locate project root (prefer settings.gradle(.kts))
-          PROJECT_DIR=$(find src -maxdepth 4 -type f -name 'settings.gradle*' -printf '%h\n' | head -n1 || true)
+          # Increased maxdepth to 8 to cope with nested zip layouts
+          PROJECT_DIR=$(find src -maxdepth 8 -type f -name 'settings.gradle*' -printf '%h\n' | head -n1 || true)
           if [ -z "$PROJECT_DIR" ]; then
-            PROJECT_DIR=$(find src -maxdepth 4 -type f \( -name 'build.gradle' -o -name 'build.gradle.kts' \) -printf '%h\n' | head -n1 || true)
+            PROJECT_DIR=$(find src -maxdepth 8 -type f \( -name 'build.gradle' -o -name 'build.gradle.kts' \) -printf '%h\n' | head -n1 || true)
           fi
 
           if [ -z "$PROJECT_DIR" ]; then
@@ -74,17 +86,18 @@ jobs:
           echo "Found Gradle project directory: $PROJECT_DIR"
           cd "$PROJECT_DIR"
           echo "Working directory: $(pwd)"
+          BUILD_EXIT=0
+
           if [ -f ./gradlew ]; then
             chmod +x ./gradlew
             echo "Using project Gradle wrapper (./gradlew)"
-            ./gradlew clean assembleRelease --no-daemon --stacktrace --warning-mode all > "$BUILD_LOG" 2>&1 || true
-            BUILD_EXIT=$?
+            ./gradlew clean assembleRelease --no-daemon --stacktrace --warning-mode all > "$BUILD_LOG" 2>&1 || BUILD_EXIT=$?
           else
             echo "No gradlew wrapper found; falling back to system gradle" | tee -a "$BUILD_LOG"
-            gradle clean assembleRelease --no-daemon --stacktrace --warning-mode all > "$BUILD_LOG" 2>&1 || true
-            BUILD_EXIT=$?
+            gradle clean assembleRelease --no-daemon --stacktrace --warning-mode all > "$BUILD_LOG" 2>&1 || BUILD_EXIT=$?
           fi
 
+          BUILD_EXIT=${BUILD_EXIT:-0}
           echo "Gradle exit code: $BUILD_EXIT" | tee -a "$BUILD_LOG"
           echo "----- tail of build log -----" | tee -a "$BUILD_LOG"
           tail -n 200 "$BUILD_LOG" | tee -a "$BUILD_LOG" || true
