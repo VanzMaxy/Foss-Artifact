@@ -22,7 +22,7 @@ jobs:
       - name: Unzip BoomingMusic zip (if present)
         run: |
           mkdir -p src
-          if [ -f BoomingMusic-1.1.0-rc.5.zip ]; then
+          if [ -f BoomingMusic-master.zip ]; then
             echo "Found zip, extracting..."
             unzip -q BoomingMusic-1.1.0-rc.5.zip -d src
           else
