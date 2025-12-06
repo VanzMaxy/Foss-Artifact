@@ -10,11 +10,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # If your Android project lives in a subdirectory (for example "android" or "app"),
-    # change APP_DIR to that path (e.g. ./android). If the project is at the repo root,
-    # leave it as '.'.
     env:
-      APP_DIR: '.'
+      # If your project is in a folder (e.g. 'app' or 'android'), change '.' to that folder name.
+      APP_DIR: '.' 
 
     steps:
       - name: Checkout repository
@@ -25,8 +23,8 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-          cache: gradle
-
+          # REMOVED 'cache: gradle' here to fix the "No file matched" error
+          
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
@@ -37,25 +35,22 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-        # Disable automatic gradle cache-file discovery when your Gradle files are not
-        # at the repo root (or when lookup fails). This prevents the "No file matched..." error.
         with:
-          cache: false
+          # Enable caching here instead. It is smarter and rarely errors out.
+          cache-disabled: false 
+
+      - name: Make Gradlew Executable
+        # Sometimes permissions are lost in git; this ensures the build script runs.
+        run: chmod +x ${{ env.APP_DIR }}/gradlew
 
       - name: Build debug APK
         working-directory: ${{ env.APP_DIR }}
         run: ./gradlew assembleDebug
 
-      - name: Find built APK/AAB
-        # This prints where the build actually placed the artifact(s).
-        # It helps when the module name or path differs from `app`.
-        run: |
-          echo "Searching for APK / AAB under $APP_DIR"
-          find $APP_DIR -type f \( -name '*.apk' -o -name '*.aab' \) -print || echo "No APK/AAB found"
-
-      - name: Upload APK/AAB artifact(s)
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PixelPlay-built-artifact
-          # Use a glob so we upload any APK/AAB under APP_DIR (works for different module names or nested paths)
-          path: ${{ env.APP_DIR }}/**/*.apk, ${{ env.APP_DIR }}/**/*.aab
+          name: PixelPlay-APK
+          # Finds any .apk file in your project directory
+          path: ${{ env.APP_DIR }}
+          /**/*.apk
