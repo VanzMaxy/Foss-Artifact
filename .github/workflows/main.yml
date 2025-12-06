@@ -1,4 +1,3 @@
-
 name: PixelPlay
 
 on:
@@ -7,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       debug:
-        description: "Show expanded src contents"
+        description: "Show src contents (no additional uploads)"
         required: false
         default: "false"
 
@@ -17,25 +16,12 @@ jobs:
     defaults:
       run:
         shell: bash
-    timeout-minutes: 60
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (shallow to save bandwidth)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-
-      - name: Ensure build.log exists (prevent missing-artifact error)
-        run: |
-          # Create an empty build.log at the workspace root so upload-artifact always finds it
-          : > "$GITHUB_WORKSPACE/build.log"
-          echo "build.log created at $GITHUB_WORKSPACE/build.log"
-        shell: bash
-
-      - name: Workspace debug (top-level)
-        run: |
-          echo "Workspace top-level:"
-          ls -la || true
+          fetch-depth: 1
 
       - name: Unzip any attached source ZIP (if present)
         run: |
@@ -43,255 +29,148 @@ jobs:
           mkdir -p src
           ZIP=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
           if [ -n "$ZIP" ]; then
-            echo "Found zip: $ZIP"
+            echo "Found zip: $ZIP (extracting to src/)"
             unzip -q "$ZIP" -d src
-            echo "Extraction complete. Top-level of src:"
-            ls -la src || true
           else
-            echo "No top-level zip found; ensure sources are in repo or placed under src/"
-            echo "Top-level of src (may already contain project files):"
-            ls -la src || true
+            echo "No top-level zip found; using repo files or src/ directory."
           fi
 
       - name: Inspect src (debug)
-        if: ${{ github.event.inputs.debug == 'true' || github.event_name == 'workflow_dispatch' }}
+        if: ${{ github.event.inputs.debug == 'true' }}
         run: ls -R src || true
 
-      - name: Set up Java (Temurin 17)
+      - name: Set up Java (Temurin 17) — required for Android/Gradle builds
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
 
-      - name: Set up Node.js (18) — no cache to avoid lockfile warning
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-          # intentionally not using `cache: 'npm'` so setup-node won't warn when no lockfile exists
-
-      - name: Set up Python (3.x) — no cache to avoid lockfile/requirements warning
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
-          # intentionally not using `cache: 'pip'` so setup-python won't attempt to find a lock file
-
-      - name: Cache Gradle directories (optional - speeds up builds)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/gradle/wrapper/gradle-wrapper.properties') }}-${{ hashFiles('**/build.gradle*', '**/build.gradle.kts') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
-
-      - name: Build (auto-detect project type, write build.log to workspace)
+      - name: Build (Gradle/Maven/Node best-effort; logs to stdout only)
         id: build
         run: |
           set -euo pipefail
-          BUILD_LOG="$GITHUB_WORKSPACE/build.log"
-          # ensure the file exists and append build info
-          : > "$BUILD_LOG"
-          echo "Build log will be written to: $BUILD_LOG"
-
           PROJECT_DIR=""
+          # prefer Gradle project markers first
           PROJECT_DIR=$(find src -maxdepth 8 -type f -name 'settings.gradle*' -printf '%h\n' | head -n1 || true)
           PROJECT_DIR=${PROJECT_DIR:-}
           if [ -z "$PROJECT_DIR" ]; then
             PROJECT_DIR=$(find src -maxdepth 8 -type f -name 'build.gradle*' -printf '%h\n' | head -n1 || true)
           fi
+          # fallback to module files for other ecosystems
           if [ -z "$PROJECT_DIR" ]; then
             PROJECT_DIR=$(find src -maxdepth 8 -type f -name 'pom.xml' -printf '%h\n' | head -n1 || true)
           fi
           if [ -z "$PROJECT_DIR" ]; then
             PROJECT_DIR=$(find src -maxdepth 8 -type f -name 'package.json' -printf '%h\n' | head -n1 || true)
           fi
-          if [ -z "$PROJECT_DIR" ]; then
-            PROJECT_DIR=$(find src -maxdepth 8 -type f -name 'pyproject.toml' -o -name 'setup.py' -printf '%h\n' | head -n1 || true)
-          fi
-          if [ -z "$PROJECT_DIR" ]; then
-            PROJECT_DIR=$(find src -maxdepth 8 -type f -name '*.csproj' -printf '%h\n' | head -n1 || true)
-          fi
 
           if [ -z "$PROJECT_DIR" ]; then
-            echo "No known project files found under src; skipping build, but will look for artifacts produced elsewhere." | tee -a "$BUILD_LOG"
+            echo "No known project files found under src — skipping build."
             echo "build_succeeded=false" >> "$GITHUB_OUTPUT" || true
             echo "project_dir=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "Found project directory: $PROJECT_DIR" | tee -a "$BUILD_LOG"
+          echo "Found project directory: $PROJECT_DIR"
           cd "$PROJECT_DIR"
-          echo "Working directory: $(pwd)" | tee -a "$BUILD_LOG"
+          echo "Working directory: $(pwd)"
 
           BUILD_EXIT=0
+          # Gradle
           if [ -f ./gradlew ]; then
             chmod +x ./gradlew
-            echo "Using Gradle wrapper (./gradlew)" | tee -a "$BUILD_LOG"
-            ./gradlew clean assembleRelease --no-daemon --stacktrace --warning-mode all >> "$BUILD_LOG" 2>&1 || BUILD_EXIT=$?
+            echo "Running Gradle wrapper..."
+            ./gradlew clean assembleRelease --no-daemon --stacktrace --warning-mode all || BUILD_EXIT=$?
           elif ls build.gradle* 1> /dev/null 2>&1 || ls settings.gradle* 1> /dev/null 2>&1; then
-            echo "Detected Gradle (system) build files" | tee -a "$BUILD_LOG"
-            gradle clean assembleRelease --no-daemon --stacktrace --warning-mode all >> "$BUILD_LOG" 2>&1 || BUILD_EXIT=$?
+            echo "Running system Gradle..."
+            gradle clean assembleRelease --no-daemon --stacktrace --warning-mode all || BUILD_EXIT=$?
+          # Maven
           elif [ -f pom.xml ]; then
-            echo "Detected Maven (pom.xml)" | tee -a "$BUILD_LOG"
-            mvn -B -DskipTests package >> "$BUILD_LOG" 2>&1 || BUILD_EXIT=$?
+            echo "Running Maven..."
+            mvn -B -DskipTests package || BUILD_EXIT=$?
+          # Node (best-effort) - may increase run time if present
           elif [ -f package.json ]; then
-            echo "Detected Node.js (package.json)" | tee -a "$BUILD_LOG"
-            npm ci >> "$BUILD_LOG" 2>&1 || true
+            echo "Running npm build (if present)..."
+            npm ci || true
             if jq -e '.scripts.build' package.json >/dev/null 2>&1; then
-              npm run build >> "$BUILD_LOG" 2>&1 || BUILD_EXIT=$?
+              npm run build || BUILD_EXIT=$?
             else
-              npm pack >> "$BUILD_LOG" 2>&1 || BUILD_EXIT=$?
+              npm pack || BUILD_EXIT=$?
             fi
-          elif [ -f pyproject.toml ] || [ -f setup.py ]; then
-            echo "Detected Python project" | tee -a "$BUILD_LOG"
-            pip3 install --upgrade build >> "$BUILD_LOG" 2>&1 || true
-            python3 -m build >> "$BUILD_LOG" 2>&1 || BUILD_EXIT=$?
-          elif ls *.csproj 1> /dev/null 2>&1; then
-            echo "Detected .NET project" | tee -a "$BUILD_LOG"
-            dotnet restore >> "$BUILD_LOG" 2>&1 || true
-            dotnet build -c Release >> "$BUILD_LOG" 2>&1 || BUILD_EXIT=$?
           else
-            echo "Unknown build system; skipping build step" | tee -a "$BUILD_LOG"
-            BUILD_EXIT=0
+            echo "Unknown build system; skipping build step."
           fi
 
           BUILD_EXIT=${BUILD_EXIT:-0}
-          echo "Build exit code: $BUILD_EXIT" | tee -a "$BUILD_LOG"
-          echo "----- tail of build log -----" | tee -a "$BUILD_LOG"
-          tail -n 200 "$BUILD_LOG" | tee -a "$BUILD_LOG" || true
-
+          echo "build_exit_code=$BUILD_EXIT" >> "$GITHUB_OUTPUT"
           if [ "$BUILD_EXIT" -eq 0 ]; then
             echo "build_succeeded=true" >> "$GITHUB_OUTPUT"
           else
             echo "build_succeeded=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "project_dir=$(pwd)" >> "$GITHUB_OUTPUT"
         shell: bash
 
-      - name: Show build.log head (for quick preview)
-        if: always()
-        run: |
-          echo "---- build.log head ----"
-          head -n 400 "$GITHUB_WORKSPACE/build.log" || true
-          echo "---- end head ----"
-
-      - name: Upload build.log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: ${{ github.workspace }}/build.log
-
-      - id: collect_artifacts
-        name: Collect build artifacts (generic)
-        if: always()
+      - id: pick_apk
+        name: Pick one APK (arm64 preferred, second-newest when available)
         run: |
           set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/dist"
-          cd "$GITHUB_WORKSPACE"
+          # Search common locations for APKs (repo root, src, and build outputs under project_dir)
+          PROJECT_DIR="${{ steps.build.outputs.project_dir }}"
+          mapfile -t APKS < <(find src . -maxdepth 8 -type f -iname '*.apk' -print 2>/dev/null || true)
+          if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ]; then
+            while IFS= read -r -d $'\0' f; do APKS+=( "$f" ); done < <(find "$PROJECT_DIR" -maxdepth 8 -type f -iname '*.apk' -print0 2>/dev/null || true)
+          fi
 
-          mapfile -t ARTS < <(find src . -maxdepth 8 -type f \( -iname '*.apk' -o -iname '*.aab' -o -iname '*.aar' -o -iname '*.ipa' -o -iname '*.jar' -o -iname '*.war' -o -iname '*.zip' -o -iname '*.tar.gz' -o -iname '*.tgz' -o -iname '*.tar' -o -iname '*.deb' -o -iname '*.rpm' -o -iname '*.exe' -o -iname '*.msi' -o -iname '*.dmg' -o -iname '*.app' -o -iname '*.whl' \) -print 2>/dev/null || true)
-
-          mapfile -t EXTRA < <(find src . -maxdepth 6 -type d \( -iname 'build' -o -iname 'dist' -o -iname 'target' -o -iname 'out' -o -iname 'release' -o -iname 'outputs' -o -iname 'bin' -o -iname 'lib' \) -print 2>/dev/null || true)
-
-          if [ "${#ARTS[@]}" -eq 0 ] && [ "${#EXTRA[@]}" -eq 0 ]; then
-            echo "No artifacts found under src or repository tree."
-            echo "artifacts_found=false" >> "$GITHUB_OUTPUT"
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "No APKs found."
+            echo "apk_found=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          for f in "${ARTS[@]}"; do
-            if [ -f "$f" ]; then
-              echo "Copying artifact: $f"
-              if cp --parents -v "$f" dist/ 2>/dev/null; then
-                :
-              else
-                cp -v "$f" "dist/$(basename "$f")"
-              fi
+          # Prefer ARM64 candidates (name/path contains arm64-v8a, arm64, aarch64)
+          ARM_CAND=()
+          for f in "${APKS[@]}"; do
+            low=$(echo "$f" | tr '[:upper:]' '[:lower:]')
+            if echo "$low" | grep -qE 'arm64-v8a|arm64|aarch64'; then
+              ARM_CAND+=( "$f" )
             fi
           done
 
-          for d in "${EXTRA[@]}"; do
-            if [ -d "$d" ]; then
-              echo "Copying directory tree: $d"
-              rsync -a --relative "$d/" dist/ || cp -r "$d"/* dist/ || true
-            fi
-          done
-
-          if [ "$(find dist -type f | wc -l)" -eq 0 ]; then
-            echo "No files were copied into dist despite matches; listing repo for debug:"
-            ls -R src || true
-            echo "artifacts_found=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          if [ "${#ARM_CAND[@]}" -gt 0 ]; then
+            CAND=( "${ARM_CAND[@]}" )
+          else
+            CAND=( "${APKS[@]}" )
           fi
 
-          echo "Artifacts copied into dist:"
-          find dist -maxdepth 3 -type f -printf '%s %p\n' | sort -nr | head -n 200 || true
-          echo "artifacts_found=true" >> "$GITHUB_OUTPUT"
+          # Sort candidates by modification time (newest first)
+          IFS=$'\n' SORTED=($(for f in "${CAND[@]}"; do printf "%s\t%s\n" "$(stat -c %Y "$f")" "$f"; done | sort -r -n | awk -F $'\t' '{print $2}'))
+          # Select second-newest if available, else newest
+          if [ "${#SORTED[@]}" -ge 2 ]; then
+            PICK="${SORTED[1]}"
+          else
+            PICK="${SORTED[0]}"
+          fi
+
+          echo "Picked APK: $PICK"
+          # Copy to workspace with minimal extra metadata; single file only
+          OUTNAME="$(basename "$PICK")"
+          cp -f "$PICK" "$GITHUB_WORKSPACE/selected.apk"
+          echo "apk_path=selected.apk" >> "$GITHUB_OUTPUT"
+          echo "apk_found=true" >> "$GITHUB_OUTPUT"
         shell: bash
 
-      - name: List dist folder (debug)
-        if: always()
-        run: |
-          echo "Contents of dist (top 200 lines):"
-          find dist -maxdepth 4 -type f -print | sed -n '1,200p' || true
-
-      - name: Upload collected artifacts
-        if: steps.collect_artifacts.outputs.artifacts_found == 'true'
+      - name: Upload single selected APK (only this artifact)
+        if: steps.pick_apk.outputs.apk_found == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: build-artifacts
-          path: dist
+          name: PixelPlay-Selected-APK
+          path: selected.apk
 
-      - id: create_zip
-        name: Create PixelPlay-master.zip (contains dist if present, else project_dir, else src)
-        if: always()
-        env:
-          PROJECT_DIR: ${{ steps.build.outputs.project_dir }}
+      - name: Finish
         run: |
-          set -euo pipefail
-          ZIP_PATH="$GITHUB_WORKSPACE/PixelPlay-master.zip"
-          rm -f "$ZIP_PATH"
-          echo "Will create PixelPlay-master.zip at $ZIP_PATH"
-
-          if [ -d "$GITHUB_WORKSPACE/dist" ] && [ "$(find "$GITHUB_WORKSPACE/dist" -type f | wc -l)" -gt 0 ]; then
-            echo "Zipping contents of dist into PixelPlay-master.zip"
-            (cd "$GITHUB_WORKSPACE/dist" && zip -r "$ZIP_PATH" .) || true
-          elif [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ] && [ "$(find "$PROJECT_DIR" -type f | wc -l)" -gt 0 ]; then
-            echo "Zipping project directory ($PROJECT_DIR) into PixelPlay-master.zip"
-            (cd "$PROJECT_DIR" && zip -r "$ZIP_PATH" .) || true
-          elif [ -d "$GITHUB_WORKSPACE/src" ] && [ "$(find "$GITHUB_WORKSPACE/src" -type f | wc -l)" -gt 0 ]; then
-            echo "Zipping src into PixelPlay-master.zip"
-            (cd "$GITHUB_WORKSPACE/src" && zip -r "$ZIP_PATH" .) || true
+          if [ "${{ steps.pick_apk.outputs.apk_found }}" == 'true' ]; then
+            echo "Uploaded exactly one APK (selected.apk)."
           else
-            echo "No files detected to include; creating small zip with README"
-            mkdir -p tmpzip
-            printf "No built artifacts or source found to include in PixelPlay-master.zip\n" > tmpzip/README.txt
-            (cd tmpzip && zip -r "$ZIP_PATH" .) || true
-            rm -rf tmpzip
+            echo "No APK uploaded because none were found."
           fi
-
-          if [ -f "$ZIP_PATH" ]; then
-            echo "Created zip:"
-            ls -lh "$ZIP_PATH" || true
-            echo "zip_path=PixelPlay-master.zip" >> "$GITHUB_OUTPUT"
-            echo "pixelplay_zip_created=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Failed to create PixelPlay-master.zip" >&2
-            echo "pixelplay_zip_created=false" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-        shell: bash
-
-      - name: Upload PixelPlay-master.zip artifact
-        if: steps.create_zip.outputs.pixelplay_zip_created == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: PixelPlay-master.zip
-          path: PixelPlay-master.zip
-
-      - name: Done
-        run: |
-          echo "Workflow complete. PixelPlay-master.zip should be attached as an artifact if it was created."
