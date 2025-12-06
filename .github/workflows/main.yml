@@ -72,4 +72,4 @@ jobs:
           name: Debug-APK
           # Search everywhere for the APK
           path:
-          '**/*.apk'
+          "PixelPlay-master/app" 
