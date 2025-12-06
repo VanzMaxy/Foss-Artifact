@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -33,7 +33,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p src
-          # Find any zip attached at repo root (generic)
           ZIP=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
           if [ -n "$ZIP" ]; then
             echo "Found zip: $ZIP"
@@ -50,15 +49,24 @@ jobs:
         if: ${{ github.event.inputs.debug == 'true' || github.event_name == 'workflow_dispatch' }}
         run: ls -R src || true
 
-      - name: Set up common runtimes
-        run: |
-          set -euo pipefail
-          echo "Ensuring JDK 17 is available"
-          sudo apt-get update -y
-          sudo apt-get install -y openjdk-17-jdk-headless || true
-          node --version || (sudo apt-get install -y nodejs npm || true)
-          python3 --version || sudo apt-get install -y python3
-          pip3 --version || sudo apt-get install -y python3-pip
+      - name: Set up Java (Temurin 17)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Node.js (18)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Set up Python (3.x)
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+          cache: 'pip'
 
       - name: Cache Gradle directories (optional - speeds up builds)
         uses: actions/cache@v4
@@ -78,7 +86,6 @@ jobs:
           : > "$BUILD_LOG"
           echo "Build log will be written to: $BUILD_LOG"
 
-          # Search for common project roots under src (maxdepth increased to handle nested zips)
           PROJECT_DIR=""
           PROJECT_DIR=$(find src -maxdepth 8 -type f -name 'settings.gradle*' -printf '%h\n' | head -n1 || true)
           PROJECT_DIR=${PROJECT_DIR:-}
@@ -110,7 +117,6 @@ jobs:
           echo "Working directory: $(pwd)" | tee -a "$BUILD_LOG"
 
           BUILD_EXIT=0
-          # Detect build system and run appropriate build command (best-effort)
           if [ -f ./gradlew ]; then
             chmod +x ./gradlew
             echo "Using Gradle wrapper (./gradlew)" | tee -a "$BUILD_LOG"
@@ -152,7 +158,6 @@ jobs:
           else
             echo "build_succeeded=false" >> "$GITHUB_OUTPUT"
           fi
-          # export the project dir found so downstream steps can reference it
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
         shell: bash
 
@@ -224,23 +229,31 @@ jobs:
           echo "Contents of dist (top 200 lines):"
           find dist -maxdepth 4 -type f -print | sed -n '1,200p' || true
 
-      - name: Create PixelPlay-master.zip (contains dist if present, else project dir, else src)
+      - name: Upload collected artifacts
+        if: steps.collect_artifacts.outputs.artifacts_found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: dist
+
+      - id: create_zip
+        name: Create PixelPlay-master.zip (contains dist if present, else project_dir, else src)
         if: always()
+        env:
+          PROJECT_DIR: ${{ steps.build.outputs.project_dir }}
+          ARTIFACTS: ${{ steps.collect_artifacts.outputs.artifacts_found }}
         run: |
           set -euo pipefail
           ZIP_PATH="$GITHUB_WORKSPACE/PixelPlay-master.zip"
           rm -f "$ZIP_PATH"
           echo "Will create PixelPlay-master.zip at $ZIP_PATH"
 
-          # Use dist if it has files
           if [ -d "$GITHUB_WORKSPACE/dist" ] && [ "$(find "$GITHUB_WORKSPACE/dist" -type f | wc -l)" -gt 0 ]; then
             echo "Zipping contents of dist into PixelPlay-master.zip"
             (cd "$GITHUB_WORKSPACE/dist" && zip -r "$ZIP_PATH" .) || true
-          # else use detected project directory from build step
-          elif [ -n "${{ steps.build.outputs.project_dir }}" ] && [ -d "${{ steps.build.outputs.project_dir }}" ] && [ "$(find "${{ steps.build.outputs.project_dir }}" -type f | wc -l)" -gt 0 ]; then
-            echo "Zipping project directory (${ { steps.build.outputs.project_dir }}) into PixelPlay-master.zip"
-            (cd "${{ steps.build.outputs.project_dir }}" && zip -r "$ZIP_PATH" .) || true
-          # else fallback to zipping src
+          elif [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ] && [ "$(find "$PROJECT_DIR" -type f | wc -l)" -gt 0 ]; then
+            echo "Zipping project directory ($PROJECT_DIR) into PixelPlay-master.zip"
+            (cd "$PROJECT_DIR" && zip -r "$ZIP_PATH" .) || true
           elif [ -d "$GITHUB_WORKSPACE/src" ] && [ "$(find "$GITHUB_WORKSPACE/src" -type f | wc -l)" -gt 0 ]; then
             echo "Zipping src into PixelPlay-master.zip"
             (cd "$GITHUB_WORKSPACE/src" && zip -r "$ZIP_PATH" .) || true
@@ -265,7 +278,7 @@ jobs:
         shell: bash
 
       - name: Upload PixelPlay-master.zip artifact
-        if: steps.Create_PixelPlay-master_zip.outputs.pixelplay_zip_created == 'true' || steps.create_pixelplay_master_zip.outputs.pixelplay_zip_created == 'true' || always()
+        if: steps.create_zip.outputs.pixelplay_zip_created == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: PixelPlay-master.zip
