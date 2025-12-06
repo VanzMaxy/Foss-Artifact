@@ -46,8 +46,16 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         run: ./gradlew assembleDebug
 
-      - name: Upload APK artifact
+      - name: Find built APK/AAB
+        # This prints where the build actually placed the artifact(s).
+        # It helps when the module name or path differs from `app`.
+        run: |
+          echo "Searching for APK / AAB under $APP_DIR"
+          find $APP_DIR -type f \( -name '*.apk' -o -name '*.aab' \) -print || echo "No APK/AAB found"
+
+      - name: Upload APK/AAB artifact(s)
         uses: actions/upload-artifact@v4
         with:
-          name: PixelPlay-debug-apk
-          path: ${{ env.APP_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+          name: PixelPlay-built-artifact
+          # Use a glob so we upload any APK/AAB under APP_DIR (works for different module names or nested paths)
+          path: ${{ env.APP_DIR }}/**/*.apk, ${{ env.APP_DIR }}/**/*.aab
