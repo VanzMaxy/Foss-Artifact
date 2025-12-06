@@ -1,230 +1,43 @@
-name: PixelPlay
+name: Build Android APK
 
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
-    inputs:
-      debug:
-        description: "Show expanded src contents and upload build log"
-        required: false
-        default: "false"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Workspace debug (top-level)
-        run: |
-          echo "Workspace top-level:"
-          ls -la || true
-
-      - name: Unzip any attached source ZIP (if present)
-        run: |
-          set -euo pipefail
-          mkdir -p src
-          ZIP=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
-          if [ -n "$ZIP" ]; then
-            echo "Found zip: $ZIP (extracting to src/)"
-            unzip -q "$ZIP" -d src
-          else
-            echo "No top-level zip found; using repo files or src/ directory."
-          fi
-
-      - name: Inspect src (debug)
-        if: ${{ github.event.inputs.debug == 'true' }}
-        run: ls -R src || true
-
-      - name: Set up Java (Temurin 17)
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: 17
+          cache: gradle
 
-      - name: Ensure helper tools available
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
         run: |
-          set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y unzip zip curl > /dev/null
+          yes | sdkmanager --licenses
+          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
-      - name: Detect project directory
-        id: detect
-        run: |
-          set -euo pipefail
-          # Prefer Gradle (settings.gradle or build.gradle), else Maven, else Node
-          PROJECT_DIR=""
-          PROJECT_DIR=$(find src -maxdepth 8 -type f -name 'settings.gradle*' -printf '%h\n' | head -n1 || true)
-          PROJECT_DIR=${PROJECT_DIR:-}
-          if [ -z "$PROJECT_DIR" ]; then
-            PROJECT_DIR=$(find src -maxdepth 8 -type f -name 'build.gradle*' -printf '%h\n' | head -n1 || true)
-          fi
-          if [ -z "$PROJECT_DIR" ]; then
-            PROJECT_DIR=$(find src -maxdepth 8 -type f -name 'pom.xml' -printf '%h\n' | head -n1 || true)
-          fi
-          if [ -z "$PROJECT_DIR" ]; then
-            PROJECT_DIR=$(find src -maxdepth 8 -type f -name 'package.json' -printf '%h\n' | head -n1 || true)
-          fi
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
 
-          # fallback: use repo root if nothing under src
-          if [ -z "$PROJECT_DIR" ] && [ -f build.gradle ] || [ -f settings.gradle ]; then
-            PROJECT_DIR="."
-          fi
+      - name: Build debug APK
+        run: ./gradlew assembleDebug
 
-          echo "project_dir=${PROJECT_DIR:-}" >> "$GITHUB_OUTPUT"
-          echo "Detected project_dir: ${PROJECT_DIR:-<none>}"
-        shell: bash
-
-      - name: Build (attempt bundleRelease and assembleRelease)
-        id: build
-        run: |
-          set -euo pipefail
-          BUILD_LOG="$GITHUB_WORKSPACE/build.log"
-          : > "$BUILD_LOG"
-          echo "Build log -> $BUILD_LOG"
-
-          PROJECT_DIR="${{ steps.detect.outputs.project_dir }}"
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "No project directory detected; skipping build." | tee -a "$BUILD_LOG"
-            echo "build_succeeded=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          cd "$PROJECT_DIR"
-          echo "Working dir: $(pwd)" | tee -a "$BUILD_LOG"
-
-          BUILD_EXIT=0
-          # Try to produce an AAB (bundle) first - more reliable for producing a universal APK
-          if [ -f ./gradlew ]; then
-            chmod +x ./gradlew
-            echo "Attempting ./gradlew clean bundleRelease assembleRelease" | tee -a "$BUILD_LOG"
-            ./gradlew clean bundleRelease assembleRelease --no-daemon --stacktrace --warning-mode all >> "$BUILD_LOG" 2>&1 || BUILD_EXIT=$?
-          else
-            # If wrapper not present but build.gradle exists, try system gradle
-            if ls build.gradle* 1> /dev/null 2>&1 || ls settings.gradle* 1> /dev/null 2>&1; then
-              echo "Attempting system gradle: gradle clean bundleRelease assembleRelease" | tee -a "$BUILD_LOG"
-              gradle clean bundleRelease assembleRelease --no-daemon --stacktrace --warning-mode all >> "$BUILD_LOG" 2>&1 || BUILD_EXIT=$?
-            else
-              echo "No Gradle build detected; skipping Android build." | tee -a "$BUILD_LOG"
-            fi
-          fi
-
-          echo "Build exit code: ${BUILD_EXIT:-0}" | tee -a "$BUILD_LOG"
-          if [ "${BUILD_EXIT:-0}" -eq 0 ]; then
-            echo "build_succeeded=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "build_succeeded=false" >> "$GITHUB_OUTPUT"
-          fi
-          echo "build_log=$BUILD_LOG" >> "$GITHUB_OUTPUT"
-        shell: bash
-
-      - name: Create a single universal APK (preferred) or pick best single APK
-        id: produce_universal
-        run: |
-          set -euo pipefail
-          WORK="$GITHUB_WORKSPACE"
-          mkdir -p "$WORK/artifacts"
-          PROJECT_DIR="${{ steps.detect.outputs.project_dir }}"
-
-          # 1) Try to find the newest .aab (produced by bundleRelease)
-          AAB=$(find "$PROJECT_DIR" -type f -iname '*.aab' -print0 2>/dev/null | xargs -0 -r ls -t | head -n1 || true)
-          if [ -n "$AAB" ]; then
-            echo "Found AAB: $AAB"
-            # download bundletool
-            BUNDLETOOL="$WORK/bundletool.jar"
-            echo "Downloading bundletool..."
-            curl -sSL -o "$BUNDLETOOL" "https://github.com/google/bundletool/releases/latest/download/bundletool-all.jar"
-            # Use bundletool to build a universal apks archive, then extract universal.apk
-            APKS_OUT="$WORK/output.apks"
-            echo "Building universal APKS from AAB..."
-            java -jar "$BUNDLETOOL" build-apks --bundle="$AAB" --output="$APKS_OUT" --mode=universal
-            # extract universal.apk
-            echo "Extracting universal.apk..."
-            unzip -p "$APKS_OUT" universal.apk > "$WORK/selected_universal.apk"
-            chmod +r "$WORK/selected_universal.apk"
-            echo "Created universal APK at $WORK/selected_universal.apk"
-            echo "artifact_path=selected_universal.apk" >> "$GITHUB_OUTPUT"
-            echo "universal_created=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # 2) If no AAB, try to find an existing universal APK (filename containing 'universal'/'fat'/'all')
-          UNIVERSAL_APK=$(find "$PROJECT_DIR" "$WORK" -maxdepth 8 -type f -iname '*universal*.apk' -o -iname '*fat*.apk' -o -iname '*all*.apk' 2>/dev/null | xargs -r ls -t | head -n1 || true)
-          if [ -n "$UNIVERSAL_APK" ]; then
-            echo "Found prebuilt universal APK: $UNIVERSAL_APK"
-            cp -f "$UNIVERSAL_APK" "$WORK/selected_universal.apk"
-            echo "artifact_path=selected_universal.apk" >> "$GITHUB_OUTPUT"
-            echo "universal_created=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # 3) Fallback: pick the best single APK (arm64 preferred), using second-newest if available
-          echo "No AAB or explicit universal APK found — falling back to picking a single best APK."
-          mapfile -t APKS < <(find "$PROJECT_DIR" "$WORK" -maxdepth 8 -type f -iname '*.apk' -print 2>/dev/null || true)
-          if [ "${#APKS[@]}" -eq 0 ]; then
-            echo "No APKs found to upload." >&2
-            echo "artifact_path=" >> "$GITHUB_OUTPUT"
-            echo "universal_created=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # prefer ARM64 candidates (path/name contains arm64-v8a, arm64, aarch64)
-          ARM_CAND=()
-          for a in "${APKS[@]}"; do
-            low=$(echo "$a" | tr '[:upper:]' '[:lower:]')
-            if echo "$low" | grep -qE 'arm64-v8a|arm64|aarch64'; then
-              ARM_CAND+=( "$a" )
-            fi
-          done
-          if [ "${#ARM_CAND[@]}" -gt 0 ]; then
-            CAND=( "${ARM_CAND[@]}" )
-          else
-            CAND=( "${APKS[@]}" )
-          fi
-
-          # sort candidates by mtime (newest first)
-          IFS=$'\n' SORTED=($(for f in "${CAND[@]}"; do printf "%s\t%s\n" "$(stat -c %Y "$f")" "$f"; done | sort -r -n | awk -F $'\t' '{print $2}'))
-          if [ "${#SORTED[@]}" -ge 2 ]; then
-            PICK="${SORTED[1]}"
-            echo "Selecting second-newest candidate: $PICK"
-          else
-            PICK="${SORTED[0]}"
-            echo "Selecting newest candidate: $PICK"
-          fi
-
-          cp -f "$PICK" "$WORK/selected_universal.apk"
-          echo "Copied chosen APK to $WORK/selected_universal.apk"
-          echo "artifact_path=selected_universal.apk" >> "$GITHUB_OUTPUT"
-          echo "universal_created=false" >> "$GITHUB_OUTPUT"
-        shell: bash
-
-      - name: Show created artifact (debug)
-        if: ${{ github.event.inputs.debug == 'true' }}
-        run: |
-          echo "Listing artifact:"
-          ls -lh selected_universal.apk || true
-
-      - name: Upload single universal APK (or best single APK) — only one file
-        if: steps.produce_universal.outputs.artifact_path != ''
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PixelPlay-Selected-Universal-APK
-          path: selected_universal.apk
-
-      - name: Done
-        run: |
-          if [ -f selected_universal.apk ]; then
-            echo "Uploaded selected_universal.apk (single artifact)."
-            echo "If it's not universal, consider enabling bundleRelease or providing an AAB in the project so the workflow can create a true universal APK."
-          else
-            echo "No APK was produced or found."
-          fi
+          name: PixelPlay-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
