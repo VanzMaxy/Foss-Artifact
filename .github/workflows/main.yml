@@ -15,12 +15,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      # STEP 1: DEBUGGING - See exactly what files are on the server
       - name: List Files (Debug)
         run: |
           echo "Current directory: $(pwd)"
           echo "----------------------------------------"
-          echo "Listing all files in repository:"
+          echo "Listing all files in repository (maxdepth 4, excluding dotfiles):"
           find . -maxdepth 4 -not -path '*/.*'
           echo "----------------------------------------"
 
@@ -30,46 +29,52 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      # STEP 2: BUILD - Smart detect using your specific path info
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
       - name: Build APK
         id: build
         run: |
-          set -e
+          set -euo pipefail
 
-          # 1. Try to find the folder specifically named "PixelPlay-master" first
-          #    or fall back to finding where settings.gradle is.
           echo "Looking for project root..."
-          
           if [ -d "PixelPlay-master" ]; then
-             PROJECT_ROOT="PixelPlay-master"
-             echo "Found explicit 'PixelPlay-master' folder."
+            PROJECT_ROOT="PixelPlay-master"
+            echo "Found explicit 'PixelPlay-master' folder."
           else
-             # Find any folder containing settings.gradle or build.gradle (up to depth 3)
-             PROJECT_ROOT=$(find . -maxdepth 3 -name settings.gradle* -o -name build.gradle.kts | head -n 1 | xargs dirname)
-          fi
-
-          if [ -z "$PROJECT_ROOT" ] || [ "$PROJECT_ROOT" == "." ]; then
-             echo "Could not find subfolder, assuming root directory."
-             PROJECT_ROOT="."
+            PROJECT_FILE=$(find . -maxdepth 3 \( -name 'settings.gradle*' -o -name 'build.gradle*' \) -print -quit)
+            if [ -n "${PROJECT_FILE:-}" ]; then
+              PROJECT_ROOT=$(dirname "$PROJECT_FILE")
+            else
+              echo "Could not find settings.gradle/build.gradle within depth 3, assuming repository root."
+              PROJECT_ROOT="."
+            fi
           fi
 
           echo "Project Root identified as: $PROJECT_ROOT"
           cd "$PROJECT_ROOT"
 
-          # 2. Make Gradlew Executable and Build
           if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
             echo "Building with Gradle Wrapper..."
-            ./gradlew assembleDebug --stacktrace
+            ./gradlew assembleDebug --no-daemon --stacktrace
           else
-            echo "No gradlew found in $PROJECT_ROOT. Using system gradle..."
-            gradle assembleDebug --stacktrace
+            echo "No gradlew found in $PROJECT_ROOT. Falling back to system gradle..."
+            gradle assembleDebug --no-daemon --stacktrace
           fi
 
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: Debug-APK
-          # Search everywhere for the APK
-          path:
-          "PixelPlay-master/app" 
+          path: |
+            # common Gradle output locations — ensures artifact is found whether project is at repo root or inside a subfolder
+            **/app/build/outputs/apk/debug/*.apk
+            **/build/outputs/apk/debug/*.apk
