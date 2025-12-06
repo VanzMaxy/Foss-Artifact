@@ -1,3 +1,4 @@
+
 name: PixelPlay
 
 on:
@@ -23,6 +24,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Ensure build.log exists (prevent missing-artifact error)
+        run: |
+          # Create an empty build.log at the workspace root so upload-artifact always finds it
+          : > "$GITHUB_WORKSPACE/build.log"
+          echo "build.log created at $GITHUB_WORKSPACE/build.log"
+        shell: bash
 
       - name: Workspace debug (top-level)
         run: |
@@ -56,17 +64,17 @@ jobs:
           java-version: '17'
           cache: gradle
 
-      - name: Set up Node.js (18)
+      - name: Set up Node.js (18) — no cache to avoid lockfile warning
         uses: actions/setup-node@v4
         with:
           node-version: '18'
-          cache: 'npm'
+          # intentionally not using `cache: 'npm'` so setup-node won't warn when no lockfile exists
 
-      - name: Set up Python (3.x)
+      - name: Set up Python (3.x) — no cache to avoid lockfile/requirements warning
         uses: actions/setup-python@v4
         with:
           python-version: '3.x'
-          cache: 'pip'
+          # intentionally not using `cache: 'pip'` so setup-python won't attempt to find a lock file
 
       - name: Cache Gradle directories (optional - speeds up builds)
         uses: actions/cache@v4
@@ -83,6 +91,7 @@ jobs:
         run: |
           set -euo pipefail
           BUILD_LOG="$GITHUB_WORKSPACE/build.log"
+          # ensure the file exists and append build info
           : > "$BUILD_LOG"
           echo "Build log will be written to: $BUILD_LOG"
 
@@ -106,7 +115,7 @@ jobs:
           fi
 
           if [ -z "$PROJECT_DIR" ]; then
-            echo "No known project files found under src; skipping build, but will look for artifacts produced elsewhere." | tee "$BUILD_LOG"
+            echo "No known project files found under src; skipping build, but will look for artifacts produced elsewhere." | tee -a "$BUILD_LOG"
             echo "build_succeeded=false" >> "$GITHUB_OUTPUT" || true
             echo "project_dir=" >> "$GITHUB_OUTPUT"
             exit 0
@@ -165,7 +174,7 @@ jobs:
         if: always()
         run: |
           echo "---- build.log head ----"
-          head -n 400 build.log || true
+          head -n 400 "$GITHUB_WORKSPACE/build.log" || true
           echo "---- end head ----"
 
       - name: Upload build.log
@@ -173,7 +182,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log
-          path: build.log
+          path: ${{ github.workspace }}/build.log
 
       - id: collect_artifacts
         name: Collect build artifacts (generic)
@@ -241,7 +250,6 @@ jobs:
         if: always()
         env:
           PROJECT_DIR: ${{ steps.build.outputs.project_dir }}
-          ARTIFACTS: ${{ steps.collect_artifacts.outputs.artifacts_found }}
         run: |
           set -euo pipefail
           ZIP_PATH="$GITHUB_WORKSPACE/PixelPlay-master.zip"
