@@ -8,6 +8,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # SDK will be installed into the runner temp directory
+      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
 
     steps:
       - name: Checkout repository
@@ -19,8 +22,8 @@ jobs:
         run: |
           echo "Current directory: $(pwd)"
           echo "----------------------------------------"
-          echo "Listing all files in repository (maxdepth 4, excluding dotfiles):"
-          find . -maxdepth 4 -not -path '*/.*'
+          echo "Listing repository (maxdepth 4):"
+          find . -maxdepth 4 -not -path '*/.*' -print
           echo "----------------------------------------"
 
       - name: Set up JDK 17
@@ -28,6 +31,37 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+
+      - name: Install Android SDK command-line tools and components
+        # We install command-line tools, platform-tools, platforms and build-tools that Gradle commonly needs.
+        run: |
+          set -euo pipefail
+
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          mkdir -p "$ANDROID_SDK_ROOT"
+          cd "$ANDROID_SDK_ROOT"
+
+          # download latest known command line tools (version token may change over time)
+          CLI_ZIP="commandlinetools-linux_latest.zip"
+          echo "Downloading Android command-line tools..."
+          curl -sS -o "$CLI_ZIP" https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
+
+          echo "Unzipping..."
+          unzip -q "$CLI_ZIP" -d cmdline-tools-temp
+
+          # Move into standard location: $ANDROID_SDK_ROOT/cmdline-tools/latest
+          mkdir -p cmdline-tools/latest
+          mv cmdline-tools-temp/cmdline-tools/* cmdline-tools/latest/ || true
+
+          # Add sdkmanager and platform-tools to PATH for subsequent steps by adding to GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
+
+          # Install essential SDK components (adjust platform and build-tools versions to your project's needs)
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-33" "build-tools;33.0.2"
+
+          # Accept all licenses
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses || true
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -39,17 +73,25 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Build APK
+      - name: Build APK (capture logs)
         id: build
+        continue-on-error: true
         run: |
           set -euo pipefail
+          set -x
 
-          echo "Looking for project root..."
+          echo "Java version:"
+          java -version || true
+
+          echo "sdkmanager version (if available):"
+          sdkmanager --version || true
+
+          echo "Searching for project root..."
           if [ -d "PixelPlay-master" ]; then
             PROJECT_ROOT="PixelPlay-master"
             echo "Found explicit 'PixelPlay-master' folder."
           else
-            PROJECT_FILE=$(find . -maxdepth 3 \( -name 'settings.gradle*' -o -name 'build.gradle*' \) -print -quit)
+            PROJECT_FILE=$(find . -maxdepth 3 \( -name 'settings.gradle*' -o -name 'build.gradle*' \) -print -quit || true)
             if [ -n "${PROJECT_FILE:-}" ]; then
               PROJECT_ROOT=$(dirname "$PROJECT_FILE")
             else
@@ -61,20 +103,39 @@ jobs:
           echo "Project Root identified as: $PROJECT_ROOT"
           cd "$PROJECT_ROOT"
 
+          echo "Listing files in project root:"
+          find . -maxdepth 4 -not -path '*/.*' -print || true
+
+          # Ensure gradlew exists and is executable
           if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
-            echo "Building with Gradle Wrapper..."
-            ./gradlew assembleDebug --no-daemon --stacktrace
+            echo "Gradle wrapper found at: $(pwd)/gradlew"
+            ./gradlew -v || true
+            echo "Building with Gradle Wrapper (output -> build.log)..."
+            ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+            EXIT_CODE=${PIPESTATUS[0]}
           else
-            echo "No gradlew found in $PROJECT_ROOT. Falling back to system gradle..."
-            gradle assembleDebug --no-daemon --stacktrace
+            echo "No gradlew found in $PROJECT_ROOT. Attempting system gradle..."
+            gradle -v || true
+            gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+            EXIT_CODE=${PIPESTATUS[0]}
           fi
 
-      - name: Upload APK artifact
+          echo "Build finished with exit code: $EXIT_CODE"
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+
+      - name: Upload build logs and APK(s)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Debug-APK
+          name: build-output
           path: |
-            # common Gradle output locations — ensures artifact is found whether project is at repo root or inside a subfolder
+            **/build.log
             **/app/build/outputs/apk/debug/*.apk
             **/build/outputs/apk/debug/*.apk
+
+      - name: Fail job if build failed
+        if: ${{ steps.build.outputs.exit_code != '0' }}
+        run: |
+          echo "Build failed with exit code ${{ steps.build.outputs.exit_code }} — failing job after uploading artifacts."
+          exit ${{ steps.build.outputs.exit_code }}
