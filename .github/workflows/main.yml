@@ -8,6 +8,12 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Use the runner's preinstalled Android SDK and make sure both SDK env variables
+    # point to the same location to avoid the "Several environment variables ... contain different paths" error.
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      JAVA_TOOL_OPTIONS: "-Dfile.encoding=UTF8"
 
     steps:
       - name: Checkout repository
@@ -15,80 +21,43 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Expose ANDROID_SDK_ROOT using runner temp directory
-        run: |
-          # Use RUNNER_TEMP to avoid expressions using runner.* at job-level
-          echo "ANDROID_SDK_ROOT=$RUNNER_TEMP/android-sdk" >> $GITHUB_ENV
-          echo "ANDROID_SDK_ROOT will be: $RUNNER_TEMP/android-sdk"
-
-      - name: List workspace (debug)
+      - name: Debug: list workspace (quick)
         run: |
           echo "Workspace: $GITHUB_WORKSPACE"
           echo "Top-level files:"
           ls -la
-          echo "If PixelPlay-master.zip is present we will extract it."
 
-      - name: Unzip PixelPlay-master.zip if needed
+      - name: Expose common SDK tools to PATH for subsequent steps
+        run: |
+          # Add the standard candidate locations for cmdline-tools and platform-tools
+          # (GITHUB_PATH takes effect for following steps)
+          echo "/usr/local/lib/android/sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH || true
+          echo "/usr/local/lib/android/sdk/cmdline-tools/bin" >> $GITHUB_PATH || true
+          echo "/usr/local/lib/android/sdk/platform-tools" >> $GITHUB_PATH || true
+          echo "/usr/local/lib/android/sdk/tools/bin" >> $GITHUB_PATH || true
+
+      - name: Show SDK & java versions (diagnostics)
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          java -version || true
+          command -v sdkmanager >/dev/null 2>&1 && sdkmanager --version || echo "sdkmanager: not found"
+
+      - name: Accept Android SDK licenses (preinstalled SDK)
         run: |
           set -euo pipefail
-          if [ -d "PixelPlay-master" ]; then
-            echo "PixelPlay-master directory already exists; skipping unzip."
-          elif [ -f "PixelPlay-master.zip" ]; then
-            echo "Found PixelPlay-master.zip — extracting to workspace root..."
-            unzip -q PixelPlay-master.zip -d .
-            echo "Extraction complete. Contents:"
-            ls -la PixelPlay-master || true
+          # sdkmanager exists in preinstalled image, accept licenses
+          if command -v sdkmanager >/dev/null 2>&1; then
+            yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses || true
           else
-            echo "No PixelPlay-master directory or zip found; continuing (will try repo root)."
+            echo "sdkmanager not available — skipping license acceptance"
           fi
 
-      - name: Show PixelPlay-master layout (if present)
-        run: |
-          if [ -d "PixelPlay-master" ]; then
-            echo "PixelPlay-master top-level:"
-            ls -la PixelPlay-master || true
-            echo "PixelPlay-master/app top-level (if present):"
-            ls -la PixelPlay-master/app || true
-          else
-            echo "PixelPlay-master not present."
-          fi
-
-      - name: Set up JDK 17
+      - name: Set up JDK 17 (ensure matching JDK)
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
-
-      - name: Install Android SDK command-line tools and components
-        run: |
-          set -euo pipefail
-          mkdir -p "$ANDROID_SDK_ROOT"
-          cd "$ANDROID_SDK_ROOT"
-
-          CLI_ZIP="commandlinetools.zip"
-          echo "Downloading Android command-line tools..."
-          curl -fsSL -o "$CLI_ZIP" "https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip"
-
-          echo "Unzipping command-line tools..."
-          unzip -q "$CLI_ZIP" -d cmdline-tools-temp
-
-          mkdir -p cmdline-tools/latest
-          if [ -d "cmdline-tools-temp/cmdline-tools" ]; then
-            mv cmdline-tools-temp/cmdline-tools/* cmdline-tools/latest/ || true
-          else
-            mv cmdline-tools-temp/*/* cmdline-tools/latest/ || true
-          fi
-
-          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          echo "Installing platform-tools, platforms;android-33 and build-tools;33.0.2 (adjust if your project requires other versions)..."
-          "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-33" "build-tools;33.0.2"
-
-          echo "Accepting licenses..."
-          yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" --licenses || true
-
-          # Expose tools to PATH for later steps
-          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -113,15 +82,10 @@ jobs:
           mkdir -p "$ARTIFACT_DIR"
           echo "Build started at $(date)" > "$LOG"
 
-          echo "Java version:" | tee -a "$LOG"
-          java -version 2>&1 | tee -a "$LOG" || true
-
           echo "Detecting project root..." | tee -a "$LOG"
-          # Prefer the PixelPlay-master folder you described
           if [ -d "PixelPlay-master" ]; then
             PROJECT_ROOT="PixelPlay-master"
           else
-            # Fallback: search for settings.gradle* or build files
             PROJECT_FILE=$(find . -maxdepth 3 \( -name 'settings.gradle*' -o -name 'build.gradle*' \) -print -quit || true)
             if [ -n "${PROJECT_FILE:-}" ]; then
               PROJECT_ROOT=$(dirname "$PROJECT_FILE")
@@ -130,48 +94,44 @@ jobs:
             fi
           fi
 
-          echo "Project root chosen: $PROJECT_ROOT" | tee -a "$LOG"
+          echo "Project root: $PROJECT_ROOT" | tee -a "$LOG"
           cd "$PROJECT_ROOT"
-
-          echo "Project root files:" | tee -a "$LOG"
-          ls -la | tee -a "$LOG" || true
+          echo "Files at project root:" | tee -a "$LOG"
+          ls -la | tee -a "$LOG"
 
           EXIT_CODE=0
           if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
-            echo "Using Gradle wrapper at: $(pwd)/gradlew" | tee -a "$LOG"
-            echo "Running ./gradlew :app:assembleDebug" | tee -a "$LOG"
+            echo "Using Gradle wrapper" | tee -a "$LOG"
             ./gradlew :app:assembleDebug --no-daemon --stacktrace 2>&1 | tee -a "$LOG"
             EXIT_CODE=${PIPESTATUS[0]:-0}
           else
-            echo "gradlew not found in $PROJECT_ROOT" | tee -a "$LOG"
+            echo "gradlew not found; attempting system gradle" | tee -a "$LOG"
             if command -v gradle >/dev/null 2>&1; then
-              echo "System gradle found: $(gradle -v | sed -n '1,1p')" | tee -a "$LOG"
               gradle :app:assembleDebug --no-daemon --stacktrace 2>&1 | tee -a "$LOG"
               EXIT_CODE=${PIPESTATUS[0]:-0}
             else
-              echo "No gradlew and no system gradle available. Cannot build." | tee -a "$LOG"
+              echo "No gradle available; cannot build" | tee -a "$LOG"
               EXIT_CODE=127
             fi
           fi
 
           echo "Build finished with exit code: $EXIT_CODE" | tee -a "$LOG"
 
-          # Copy APK/AAB outputs into artifacts folder
-          echo "Collecting outputs..." | tee -a "$LOG"
+          # Copy APKs/AABs to artifacts directory (explicit app path + generic search)
           APP_DEBUG_DIR="$(pwd)/app/build/outputs/apk/debug"
           if [ -d "$APP_DEBUG_DIR" ]; then
-            echo "Found app debug dir: $APP_DEBUG_DIR" | tee -a "$LOG"
+            echo "Copying from $APP_DEBUG_DIR to artifacts" | tee -a "$LOG"
             cp -r "$APP_DEBUG_DIR"/* "$ARTIFACT_DIR/" 2>/dev/null || true
           fi
 
-          # Search for any APK/AAB under module build/outputs and copy
+          # Generic search for outputs (exclude .gradle cache)
           find . -type f \( -name "*.apk" -o -name "*.aab" \) -not -path "*/.gradle/*" -print | tee -a "$LOG" | while read -r f; do
-            echo "Copying $f to artifacts" | tee -a "$LOG"
+            echo "Copying $f" | tee -a "$LOG"
             cp --parents "$f" "$ARTIFACT_DIR/" 2>/dev/null || cp "$f" "$ARTIFACT_DIR/" 2>/dev/null || true
           done
 
-          echo "Artifacts dir contents:" | tee -a "$LOG"
+          echo "Artifacts contents:" | tee -a "$LOG"
           find "$ARTIFACT_DIR" -maxdepth 5 -type f -print | tee -a "$LOG" || echo "(no artifacts found)" | tee -a "$LOG"
 
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
