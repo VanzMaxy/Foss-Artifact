@@ -17,21 +17,40 @@ jobs:
 
       - name: Expose ANDROID_SDK_ROOT using runner temp directory
         run: |
+          # Use RUNNER_TEMP to avoid expressions using runner.* at job-level
           echo "ANDROID_SDK_ROOT=$RUNNER_TEMP/android-sdk" >> $GITHUB_ENV
           echo "ANDROID_SDK_ROOT will be: $RUNNER_TEMP/android-sdk"
 
-      - name: List repository top-level and PixelPlay-master contents (Debug)
+      - name: List workspace (debug)
         run: |
           echo "Workspace: $GITHUB_WORKSPACE"
           echo "Top-level files:"
           ls -la
-          echo "PixelPlay-master contents (if present):"
+          echo "If PixelPlay-master.zip is present we will extract it."
+
+      - name: Unzip PixelPlay-master.zip if needed
+        run: |
+          set -euo pipefail
           if [ -d "PixelPlay-master" ]; then
+            echo "PixelPlay-master directory already exists; skipping unzip."
+          elif [ -f "PixelPlay-master.zip" ]; then
+            echo "Found PixelPlay-master.zip — extracting to workspace root..."
+            unzip -q PixelPlay-master.zip -d .
+            echo "Extraction complete. Contents:"
             ls -la PixelPlay-master || true
-            echo "PixelPlay-master/app contents:"
+          else
+            echo "No PixelPlay-master directory or zip found; continuing (will try repo root)."
+          fi
+
+      - name: Show PixelPlay-master layout (if present)
+        run: |
+          if [ -d "PixelPlay-master" ]; then
+            echo "PixelPlay-master top-level:"
+            ls -la PixelPlay-master || true
+            echo "PixelPlay-master/app top-level (if present):"
             ls -la PixelPlay-master/app || true
           else
-            echo "PixelPlay-master directory not present"
+            echo "PixelPlay-master not present."
           fi
 
       - name: Set up JDK 17
@@ -43,7 +62,6 @@ jobs:
       - name: Install Android SDK command-line tools and components
         run: |
           set -euo pipefail
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
           mkdir -p "$ANDROID_SDK_ROOT"
           cd "$ANDROID_SDK_ROOT"
 
@@ -62,14 +80,13 @@ jobs:
           fi
 
           SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-
-          echo "Installing platform-tools, platforms;android-33 and build-tools;33.0.2 (adjust versions if needed)..."
+          echo "Installing platform-tools, platforms;android-33 and build-tools;33.0.2 (adjust if your project requires other versions)..."
           "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-33" "build-tools;33.0.2"
 
           echo "Accepting licenses..."
           yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" --licenses || true
 
-          # Add tools to PATH for subsequent steps
+          # Expose tools to PATH for later steps
           echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
 
@@ -99,25 +116,27 @@ jobs:
           echo "Java version:" | tee -a "$LOG"
           java -version 2>&1 | tee -a "$LOG" || true
 
-          echo "sdkmanager path & version (if available):" | tee -a "$LOG"
-          command -v sdkmanager >/dev/null 2>&1 && sdkmanager --version 2>&1 | tee -a "$LOG" || echo "sdkmanager not on PATH yet" | tee -a "$LOG"
-
-          # We know from you that PixelPlay-master exists with gradlew and settings in it.
-          PROJECT_ROOT="PixelPlay-master"
-          if [ ! -d "$PROJECT_ROOT" ]; then
-            echo "PixelPlay-master not found — listing workspace:" | tee -a "$LOG"
-            ls -la | tee -a "$LOG"
-            echo "Assuming repository root as project root" | tee -a "$LOG"
-            PROJECT_ROOT="."
+          echo "Detecting project root..." | tee -a "$LOG"
+          # Prefer the PixelPlay-master folder you described
+          if [ -d "PixelPlay-master" ]; then
+            PROJECT_ROOT="PixelPlay-master"
+          else
+            # Fallback: search for settings.gradle* or build files
+            PROJECT_FILE=$(find . -maxdepth 3 \( -name 'settings.gradle*' -o -name 'build.gradle*' \) -print -quit || true)
+            if [ -n "${PROJECT_FILE:-}" ]; then
+              PROJECT_ROOT=$(dirname "$PROJECT_FILE")
+            else
+              PROJECT_ROOT="."
+            fi
           fi
 
-          echo "Project Root: $PROJECT_ROOT" | tee -a "$LOG"
+          echo "Project root chosen: $PROJECT_ROOT" | tee -a "$LOG"
           cd "$PROJECT_ROOT"
 
           echo "Project root files:" | tee -a "$LOG"
-          ls -la | tee -a "$LOG"
+          ls -la | tee -a "$LOG" || true
 
-          # Ensure gradlew exists and is executable
+          EXIT_CODE=0
           if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
             echo "Using Gradle wrapper at: $(pwd)/gradlew" | tee -a "$LOG"
@@ -138,23 +157,22 @@ jobs:
 
           echo "Build finished with exit code: $EXIT_CODE" | tee -a "$LOG"
 
-          # Copy APK/AAB outputs into artifacts folder (preserve relative paths where possible)
+          # Copy APK/AAB outputs into artifacts folder
           echo "Collecting outputs..." | tee -a "$LOG"
-          # Most common debug APK location:
           APP_DEBUG_DIR="$(pwd)/app/build/outputs/apk/debug"
           if [ -d "$APP_DEBUG_DIR" ]; then
             echo "Found app debug dir: $APP_DEBUG_DIR" | tee -a "$LOG"
             cp -r "$APP_DEBUG_DIR"/* "$ARTIFACT_DIR/" 2>/dev/null || true
           fi
 
-          # Also search for any APK/AAB under module build/outputs
+          # Search for any APK/AAB under module build/outputs and copy
           find . -type f \( -name "*.apk" -o -name "*.aab" \) -not -path "*/.gradle/*" -print | tee -a "$LOG" | while read -r f; do
             echo "Copying $f to artifacts" | tee -a "$LOG"
             cp --parents "$f" "$ARTIFACT_DIR/" 2>/dev/null || cp "$f" "$ARTIFACT_DIR/" 2>/dev/null || true
           done
 
           echo "Artifacts dir contents:" | tee -a "$LOG"
-          find "$ARTIFACT_DIR" -maxdepth 4 -type f -print | tee -a "$LOG" || echo "(no artifacts found)" | tee -a "$LOG"
+          find "$ARTIFACT_DIR" -maxdepth 5 -type f -print | tee -a "$LOG" || echo "(no artifacts found)" | tee -a "$LOG"
 
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
