@@ -8,145 +8,41 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Use the runner's preinstalled Android SDK and make sure both SDK env variables
-    # point to the same location to avoid the "Several environment variables ... contain different paths" error.
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-      JAVA_TOOL_OPTIONS: "-Dfile.encoding=UTF8"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Debug: list workspace (quick)
-        run: |
-          echo "Workspace: $GITHUB_WORKSPACE"
-          echo "Top-level files:"
-          ls -la
-
-      - name: Expose common SDK tools to PATH for subsequent steps
-        run: |
-          # Add the standard candidate locations for cmdline-tools and platform-tools
-          # (GITHUB_PATH takes effect for following steps)
-          echo "/usr/local/lib/android/sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH || true
-          echo "/usr/local/lib/android/sdk/cmdline-tools/bin" >> $GITHUB_PATH || true
-          echo "/usr/local/lib/android/sdk/platform-tools" >> $GITHUB_PATH || true
-          echo "/usr/local/lib/android/sdk/tools/bin" >> $GITHUB_PATH || true
-
-      - name: Show SDK & java versions (diagnostics)
-        run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-          java -version || true
-          command -v sdkmanager >/dev/null 2>&1 && sdkmanager --version || echo "sdkmanager: not found"
-
-      - name: Accept Android SDK licenses (preinstalled SDK)
-        run: |
-          set -euo pipefail
-          # sdkmanager exists in preinstalled image, accept licenses
-          if command -v sdkmanager >/dev/null 2>&1; then
-            yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses || true
-          else
-            echo "sdkmanager not available — skipping license acceptance"
-          fi
-
-      - name: Set up JDK 17 (ensure matching JDK)
+      - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
-
-      - name: Build :app:assembleDebug (capture logs & collect outputs)
-        id: build
-        continue-on-error: true
+      - name: Unzip Repository Zip
         run: |
-          set -euo pipefail
-          set -x
+          # Unzip the file
+          echo "Unzipping PixelPlay-master.zip..."
+          unzip -q PixelPlay-master.zip
+          
+          # Verify contents (for debugging)
+          ls -R
+        
+      - name: Grant Execute Permission to Gradlew
+        run: |
+          # We need to find where gradlew is after unzipping
+          # Usually it is inside the folder PixelPlay-master
+          cd PixelPlay-master
+          chmod +x gradlew
 
-          LOG="$GITHUB_WORKSPACE/build.log"
-          ARTIFACT_DIR="$GITHUB_WORKSPACE/artifacts"
-          mkdir -p "$(dirname "$LOG")"
-          mkdir -p "$ARTIFACT_DIR"
-          echo "Build started at $(date)" > "$LOG"
+      - name: Build with Gradle
+        run: |
+          cd PixelPlay-master
+          ./gradlew assembleDebug --stacktrace
 
-          echo "Detecting project root..." | tee -a "$LOG"
-          if [ -d "PixelPlay-master" ]; then
-            PROJECT_ROOT="PixelPlay-master"
-          else
-            PROJECT_FILE=$(find . -maxdepth 3 \( -name 'settings.gradle*' -o -name 'build.gradle*' \) -print -quit || true)
-            if [ -n "${PROJECT_FILE:-}" ]; then
-              PROJECT_ROOT=$(dirname "$PROJECT_FILE")
-            else
-              PROJECT_ROOT="."
-            fi
-          fi
-
-          echo "Project root: $PROJECT_ROOT" | tee -a "$LOG"
-          cd "$PROJECT_ROOT"
-          echo "Files at project root:" | tee -a "$LOG"
-          ls -la | tee -a "$LOG"
-
-          EXIT_CODE=0
-          if [ -f "./gradlew" ]; then
-            chmod +x ./gradlew
-            echo "Using Gradle wrapper" | tee -a "$LOG"
-            ./gradlew :app:assembleDebug --no-daemon --stacktrace 2>&1 | tee -a "$LOG"
-            EXIT_CODE=${PIPESTATUS[0]:-0}
-          else
-            echo "gradlew not found; attempting system gradle" | tee -a "$LOG"
-            if command -v gradle >/dev/null 2>&1; then
-              gradle :app:assembleDebug --no-daemon --stacktrace 2>&1 | tee -a "$LOG"
-              EXIT_CODE=${PIPESTATUS[0]:-0}
-            else
-              echo "No gradle available; cannot build" | tee -a "$LOG"
-              EXIT_CODE=127
-            fi
-          fi
-
-          echo "Build finished with exit code: $EXIT_CODE" | tee -a "$LOG"
-
-          # Copy APKs/AABs to artifacts directory (explicit app path + generic search)
-          APP_DEBUG_DIR="$(pwd)/app/build/outputs/apk/debug"
-          if [ -d "$APP_DEBUG_DIR" ]; then
-            echo "Copying from $APP_DEBUG_DIR to artifacts" | tee -a "$LOG"
-            cp -r "$APP_DEBUG_DIR"/* "$ARTIFACT_DIR/" 2>/dev/null || true
-          fi
-
-          # Generic search for outputs (exclude .gradle cache)
-          find . -type f \( -name "*.apk" -o -name "*.aab" \) -not -path "*/.gradle/*" -print | tee -a "$LOG" | while read -r f; do
-            echo "Copying $f" | tee -a "$LOG"
-            cp --parents "$f" "$ARTIFACT_DIR/" 2>/dev/null || cp "$f" "$ARTIFACT_DIR/" 2>/dev/null || true
-          done
-
-          echo "Artifacts contents:" | tee -a "$LOG"
-          find "$ARTIFACT_DIR" -maxdepth 5 -type f -print | tee -a "$LOG" || echo "(no artifacts found)" | tee -a "$LOG"
-
-          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
-
-      - name: Upload build log and artifacts
-        if: always()
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: build-output
-          path: |
-            build.log
-            artifacts/**
-
-      - name: Fail job if build failed
-        if: ${{ steps.build.outputs.exit_code != '0' }}
-        run: |
-          echo "Build failed with exit code ${{ steps.build.outputs.exit_code }} — failing job after uploading artifacts."
-          exit ${{ steps.build.outputs.exit_code }}
+          name: PixelPlay-Debug-APK
+          # This wildcard finds the .apk file even if pathing is slightly off
+          path: "**/*.apk"
